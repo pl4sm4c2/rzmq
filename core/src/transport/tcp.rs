@@ -1142,8 +1142,8 @@ impl TcpConnecter {
             match system_event_rx.recv().await {
               Ok(SystemEvent::ContextTerminating) => break,
               Ok(SystemEvent::ActorStopping { handle_id, .. }) if handle_id == self.parent_socket_id => break,
-              Ok(_) => continue,
-              Err(_) => break,
+              Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => continue,
+              Err(broadcast::error::RecvError::Closed) => break,
             }
           }
         } => {
@@ -1178,12 +1178,16 @@ impl TcpConnecter {
     next_attempt_num: usize,
   ) -> Result<bool, ()> {
     if delay.is_zero() {
-      match system_event_rx.try_recv() {
-        Ok(SystemEvent::ContextTerminating) => return Ok(false),
-        Ok(SystemEvent::ActorStopping { handle_id, .. }) if handle_id == self.parent_socket_id => {
-          return Ok(false);
+      loop {
+        match system_event_rx.try_recv() {
+          Ok(SystemEvent::ContextTerminating) => return Ok(false),
+          Ok(SystemEvent::ActorStopping { handle_id, .. }) if handle_id == self.parent_socket_id => {
+            return Ok(false);
+          }
+          Ok(_) | Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
+          Err(broadcast::error::TryRecvError::Closed) => return Ok(false),
+          Err(broadcast::error::TryRecvError::Empty) => return Ok(true),
         }
-        _ => return Ok(true),
       }
     }
     tracing::debug!(handle = self.handle, uri = %self.endpoint, ?delay, "Connecter waiting before attempt #{}", next_attempt_num);
@@ -1191,17 +1195,26 @@ impl TcpConnecter {
       endpoint: self.endpoint.clone(),
       interval: delay,
     });
-    tokio::select! {
-      biased;
-      event_res = system_event_rx.recv() => {
-        match event_res {
-          Ok(SystemEvent::ContextTerminating) => Ok(false),
-          Ok(SystemEvent::ActorStopping { handle_id, .. }) if handle_id == self.parent_socket_id => Ok(false),
-          Err(_) => Ok(false),
-          Ok(_) => Ok(true),
+    let sleep = tokio::time::sleep(delay);
+    tokio::pin!(sleep);
+
+    loop {
+      tokio::select! {
+        biased;
+        event_res = system_event_rx.recv() => {
+          match event_res {
+            Ok(SystemEvent::ContextTerminating) => return Ok(false),
+            Ok(SystemEvent::ActorStopping { handle_id, .. }) if handle_id == self.parent_socket_id => return Ok(false),
+            Err(broadcast::error::RecvError::Closed) => return Ok(false),
+            Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {
+              // Non-terminal events on the shared context event bus (e.g. sibling sockets'
+              // lifecycle events) or transient broadcast lag must not abort the backoff delay
+              // or permanently terminate the connecter.
+            }
+          }
         }
+        _ = &mut sleep => return Ok(true),
       }
-      _ = tokio::time::sleep(delay) => Ok(true),
     }
   }
 }
