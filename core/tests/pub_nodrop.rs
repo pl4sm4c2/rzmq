@@ -45,8 +45,13 @@ async fn drain(sub: &Socket) -> Vec<u64> {
   seqs
 }
 
-fn spawn_reader(sub: Socket) -> tokio::task::JoinHandle<Vec<u64>> {
-  tokio::spawn(async move { drain(&sub).await })
+/// Hands the socket back with the sequence numbers so the subscriber stays connected after
+/// the reader goes idle. Dropping it inside the task would stop the SUB early.
+fn spawn_reader(sub: Socket) -> tokio::task::JoinHandle<(Vec<u64>, Socket)> {
+  tokio::spawn(async move {
+    let seqs = drain(&sub).await;
+    (seqs, sub)
+  })
 }
 
 #[tokio::test]
@@ -147,7 +152,8 @@ async fn assert_all_or_nothing(endpoint_for: impl AsyncFnOnce(&Socket) -> Result
     let slow_seqs = drain(&slow).await;
     assert_eq!(slow_seqs, accepted, "slow subscriber");
     for reader in fast_readers {
-      assert_eq!(reader.await.unwrap(), accepted, "fast subscriber");
+      let (seqs, _sub) = reader.await.unwrap();
+      assert_eq!(seqs, accepted, "fast subscriber");
     }
   }
   ctx.term().await

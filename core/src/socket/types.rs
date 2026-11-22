@@ -42,12 +42,15 @@ pub enum SocketType {
   Pull,
 }
 
-struct SocketDropGuard {
+/// State shared by every clone of a `Socket`. When the last clone is dropped without
+/// `close()` having been called, this sends `Command::Stop` so the `SocketCore` actor and
+/// its connecters do not keep running until `Context::term()`.
+struct SocketShared {
   core_command_sender: MailboxSender,
-  closed: Arc<AtomicBool>,
+  closed: AtomicBool,
 }
 
-impl Drop for SocketDropGuard {
+impl Drop for SocketShared {
   fn drop(&mut self) {
     if self
       .closed
@@ -56,14 +59,19 @@ impl Drop for SocketDropGuard {
     {
       match self.core_command_sender.try_send(Command::Stop) {
         Ok(()) => {}
-        Err(TrySendError::Full(cmd)) => {
-          if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        Err(TrySendError::Full(cmd)) => match tokio::runtime::Handle::try_current() {
+          Ok(handle) => {
             let sender = self.core_command_sender.clone();
             handle.spawn(async move {
               let _ = sender.send(cmd).await;
             });
           }
-        }
+          Err(_) => tracing::warn!(
+            "Socket dropped outside a Tokio runtime with a full command mailbox; \
+             SocketCore will stop at Context::term()"
+          ),
+        },
+        // Mailbox closed: the actor has already stopped.
         Err(_) => {}
       }
     }
@@ -80,13 +88,8 @@ pub struct Socket {
   // `inner` holds an `Arc` to the trait object implementing the specific socket pattern logic.
   // This allows `Socket` to be a generic handle for any `SocketType`.
   pub(crate) inner: Arc<dyn ISocket>,
-  // Stores a clone of the command sender for the `SocketCore` actor associated with this socket.
-  // This is used to send user-initiated commands (like bind, connect, send, recv) to the core actor.
-  pub(crate) core_command_sender: MailboxSender,
-  pub(crate) closed: Arc<AtomicBool>,
-  // Shared guard that sends `Command::Stop` to `SocketCore` once the final `Socket` clone drops
-  // if `close()` was not explicitly called.
-  _drop_guard: Arc<SocketDropGuard>,
+  // Command sender for the `SocketCore` actor and the `closed` flag, shared by all clones.
+  shared: Arc<SocketShared>,
 }
 
 impl Socket {
@@ -98,16 +101,12 @@ impl Socket {
   /// * `socket_impl` - An `Arc` to the `ISocket` trait object that implements the socket's pattern logic.
   /// * `core_command_sender` - The `MailboxSender` for the `SocketCore` actor managing this socket.
   pub(crate) fn new(socket_impl: Arc<dyn ISocket>, core_command_sender: MailboxSender) -> Self {
-    let closed = Arc::new(AtomicBool::new(false));
-    let drop_guard = Arc::new(SocketDropGuard {
-      core_command_sender: core_command_sender.clone(),
-      closed: Arc::clone(&closed),
-    });
     Self {
       inner: socket_impl,
-      core_command_sender,
-      closed,
-      _drop_guard: drop_guard,
+      shared: Arc::new(SocketShared {
+        core_command_sender,
+        closed: AtomicBool::new(false),
+      }),
     }
   }
 
@@ -206,6 +205,7 @@ impl Socket {
   /// Further operations on the socket after calling `close()` may fail.
   pub async fn close(&self) -> Result<(), ZmqError> {
     if self
+      .shared
       .closed
       .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
       .is_ok()
@@ -240,6 +240,7 @@ impl Socket {
     };
 
     self
+      .shared
       .core_command_sender
       .send(cmd)
       .await
