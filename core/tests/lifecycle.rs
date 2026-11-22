@@ -450,3 +450,90 @@ async fn test_concurrent_term_and_op() -> Result<(), ZmqError> {
   println!("Test test_concurrent_term_and_op finished.");
   Ok(())
 }
+
+/// Dropping the last `Socket` handle without explicitly calling `close().await`
+/// must still stop its `SocketCore` actor and disconnect peers cleanly.
+#[tokio::test]
+async fn test_socket_drop_without_close_stops_actor_and_disconnects_peer() -> anyhow::Result<()> {
+  let ctx = common::test_context();
+  let push = ctx.socket(SocketType::Push)?;
+  let push_monitor = push.monitor_default().await?;
+  let endpoint = common::bind_and_resolve_tcp(&push).await?;
+
+  {
+    let pull = ctx.socket(SocketType::Pull)?;
+    pull.connect(&endpoint).await?;
+
+    common::wait_for_monitor_event(&push_monitor, MONITOR_EVENT_TIMEOUT, SHORT_TIMEOUT, |e| {
+      matches!(e, SocketEvent::HandshakeSucceeded { .. })
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("HandshakeSucceeded wait failed: {}", e))?;
+
+    push.send(Msg::from_static(b"before-drop")).await?;
+    let msg = common::recv_timeout(&pull, LONG_TIMEOUT).await?;
+    assert_eq!(msg.data().unwrap(), b"before-drop");
+    // Intentionally drop `pull` without calling `pull.close().await`.
+  }
+
+  common::wait_for_monitor_event(&push_monitor, MONITOR_EVENT_TIMEOUT, SHORT_TIMEOUT, |e| {
+    matches!(e, SocketEvent::Disconnected { .. })
+  })
+  .await
+  .map_err(|e| anyhow::anyhow!("Peer did not observe Disconnected after Socket drop: {}", e))?;
+
+  push.set_option_raw(SNDTIMEO, &(0i32).to_ne_bytes()).await?;
+  let send_res = push.send(Msg::from_static(b"after-drop")).await;
+  assert!(
+    matches!(send_res, Err(ZmqError::ResourceLimitReached)),
+    "Expected ResourceLimitReached after dropped peer disconnected, got {:?}",
+    send_res
+  );
+
+  ctx.term().await?;
+  Ok(())
+}
+
+/// Dropping a cloned `Socket` handle must keep the socket alive while another
+/// clone still exists, and only stop the actor once the last clone is dropped.
+#[tokio::test]
+async fn test_socket_clone_drop_keeps_socket_alive_until_last_handle_drops() -> anyhow::Result<()> {
+  let ctx = common::test_context();
+  let push = ctx.socket(SocketType::Push)?;
+  let push_monitor = push.monitor_default().await?;
+  let endpoint = common::bind_and_resolve_tcp(&push).await?;
+
+  let pull = ctx.socket(SocketType::Pull)?;
+  pull.connect(&endpoint).await?;
+
+  common::wait_for_monitor_event(&push_monitor, MONITOR_EVENT_TIMEOUT, SHORT_TIMEOUT, |e| {
+    matches!(e, SocketEvent::HandshakeSucceeded { .. })
+  })
+  .await
+  .map_err(|e| anyhow::anyhow!("HandshakeSucceeded wait failed: {}", e))?;
+
+  let pull_clone = pull.clone();
+  drop(pull_clone);
+  tokio::time::sleep(Duration::from_millis(50)).await;
+
+  // Socket must remain operational via the surviving handle.
+  push.send(Msg::from_static(b"still-alive")).await?;
+  let msg = common::recv_timeout(&pull, LONG_TIMEOUT).await?;
+  assert_eq!(msg.data().unwrap(), b"still-alive");
+
+  // Dropping the final handle must stop the actor and trigger peer disconnect.
+  drop(pull);
+  common::wait_for_monitor_event(&push_monitor, MONITOR_EVENT_TIMEOUT, SHORT_TIMEOUT, |e| {
+    matches!(e, SocketEvent::Disconnected { .. })
+  })
+  .await
+  .map_err(|e| {
+    anyhow::anyhow!(
+      "Peer did not observe Disconnected after final Socket clone dropped: {}",
+      e
+    )
+  })?;
+
+  ctx.term().await?;
+  Ok(())
+}

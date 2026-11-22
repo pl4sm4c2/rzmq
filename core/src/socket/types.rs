@@ -4,6 +4,7 @@ use crate::runtime::Command;
 use crate::runtime::MailboxSender;
 use crate::socket::ISocket;
 use crate::socket::events::{DEFAULT_MONITOR_CAPACITY, MonitorReceiver};
+use fibre::TrySendError;
 use fibre::mpsc::bounded_async;
 use fibre::oneshot;
 use std::fmt;
@@ -41,6 +42,34 @@ pub enum SocketType {
   Pull,
 }
 
+struct SocketDropGuard {
+  core_command_sender: MailboxSender,
+  closed: Arc<AtomicBool>,
+}
+
+impl Drop for SocketDropGuard {
+  fn drop(&mut self) {
+    if self
+      .closed
+      .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+      .is_ok()
+    {
+      match self.core_command_sender.try_send(Command::Stop) {
+        Ok(()) => {}
+        Err(TrySendError::Full(cmd)) => {
+          if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let sender = self.core_command_sender.clone();
+            handle.spawn(async move {
+              let _ = sender.send(cmd).await;
+            });
+          }
+        }
+        Err(_) => {}
+      }
+    }
+  }
+}
+
 /// The public handle for interacting with an rzmq socket.
 /// This struct provides the user-facing API for socket operations.
 /// Handles are cloneable (`Arc`-based), allowing them to be shared across tasks.
@@ -55,6 +84,9 @@ pub struct Socket {
   // This is used to send user-initiated commands (like bind, connect, send, recv) to the core actor.
   pub(crate) core_command_sender: MailboxSender,
   pub(crate) closed: Arc<AtomicBool>,
+  // Shared guard that sends `Command::Stop` to `SocketCore` once the final `Socket` clone drops
+  // if `close()` was not explicitly called.
+  _drop_guard: Arc<SocketDropGuard>,
 }
 
 impl Socket {
@@ -66,10 +98,16 @@ impl Socket {
   /// * `socket_impl` - An `Arc` to the `ISocket` trait object that implements the socket's pattern logic.
   /// * `core_command_sender` - The `MailboxSender` for the `SocketCore` actor managing this socket.
   pub(crate) fn new(socket_impl: Arc<dyn ISocket>, core_command_sender: MailboxSender) -> Self {
+    let closed = Arc::new(AtomicBool::new(false));
+    let drop_guard = Arc::new(SocketDropGuard {
+      core_command_sender: core_command_sender.clone(),
+      closed: Arc::clone(&closed),
+    });
     Self {
       inner: socket_impl,
       core_command_sender,
-      closed: Arc::new(AtomicBool::new(false)),
+      closed,
+      _drop_guard: drop_guard,
     }
   }
 
