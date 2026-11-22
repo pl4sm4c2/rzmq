@@ -601,14 +601,15 @@ async fn test_tcp_reconnect_backoff_not_aborted_by_sibling_system_events() -> Re
   .map_err(|e| ZmqError::Internal(format!("Never saw initial ConnectRetried: {}", e)))?;
 
   // Generate a burst of unrelated SystemEvents on the same context while PUSH is backing off.
+  let burst_started = std::time::Instant::now();
   for _ in 0..16 {
     let sibling = ctx.socket(SocketType::Push)?;
     sibling.close().await?;
     sleep(Duration::from_millis(10)).await;
   }
 
-  // Drain any monitor events accumulated during the ~160ms burst. With RECONNECT_IVL = 400ms,
-  // the connecter must still be honoring its backoff instead of spinning on every sibling event.
+  // Count retries emitted during the burst. A connecter that honors RECONNECT_IVL can retry
+  // at most once per interval (plus one already in flight), however long the burst took.
   let mut extra_retries = 0usize;
   while let Ok(Ok(event)) =
     tokio::time::timeout(Duration::from_millis(5), push_monitor_rx.recv()).await
@@ -617,10 +618,14 @@ async fn test_tcp_reconnect_backoff_not_aborted_by_sibling_system_events() -> Re
       extra_retries += 1;
     }
   }
+  let burst_elapsed = burst_started.elapsed();
+  let allowed_retries = (burst_elapsed.as_millis() / reconnect_ivl_ms as u128) as usize + 1;
   assert!(
-    extra_retries <= 2,
-    "Expected backoff to suppress tight reconnect retries during sibling SystemEvent burst, got {} extra ConnectRetried events in ~160ms with RECONNECT_IVL={}ms",
+    extra_retries <= allowed_retries,
+    "Backoff did not hold during sibling SystemEvent burst: {} ConnectRetried events in {:?} (allowed {} with RECONNECT_IVL={}ms)",
     extra_retries,
+    burst_elapsed,
+    allowed_retries,
     reconnect_ivl_ms
   );
 

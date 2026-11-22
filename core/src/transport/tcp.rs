@@ -1142,6 +1142,7 @@ impl TcpConnecter {
             match system_event_rx.recv().await {
               Ok(SystemEvent::ContextTerminating) => break,
               Ok(SystemEvent::ActorStopping { handle_id, .. }) if handle_id == self.parent_socket_id => break,
+              Err(broadcast::error::RecvError::Lagged(_)) if self.parent_gone() => break,
               Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => continue,
               Err(broadcast::error::RecvError::Closed) => break,
             }
@@ -1184,9 +1185,10 @@ impl TcpConnecter {
           Ok(SystemEvent::ActorStopping { handle_id, .. }) if handle_id == self.parent_socket_id => {
             return Ok(false);
           }
+          Err(broadcast::error::TryRecvError::Lagged(_)) if self.parent_gone() => return Ok(false),
           Ok(_) | Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
           Err(broadcast::error::TryRecvError::Closed) => return Ok(false),
-          Err(broadcast::error::TryRecvError::Empty) => return Ok(true),
+          Err(broadcast::error::TryRecvError::Empty) => return Ok(!self.parent_gone()),
         }
       }
     }
@@ -1206,16 +1208,28 @@ impl TcpConnecter {
             Ok(SystemEvent::ContextTerminating) => return Ok(false),
             Ok(SystemEvent::ActorStopping { handle_id, .. }) if handle_id == self.parent_socket_id => return Ok(false),
             Err(broadcast::error::RecvError::Closed) => return Ok(false),
+            // Lag may have dropped our own shutdown event, so fall back to the direct signals.
+            Err(broadcast::error::RecvError::Lagged(_)) if self.parent_gone() => return Ok(false),
             Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {
-              // Non-terminal events on the shared context event bus (e.g. sibling sockets'
-              // lifecycle events) or transient broadcast lag must not abort the backoff delay
-              // or permanently terminate the connecter.
+              // Events for other sockets on the shared context bus must not cut the
+              // backoff short.
             }
           }
         }
-        _ = &mut sleep => return Ok(true),
+        _ = &mut sleep => return Ok(!self.parent_gone()),
       }
     }
+  }
+
+  /// Shutdown check that does not depend on the event bus. Used after broadcast lag,
+  /// which can drop `ContextTerminating` or this socket's `ActorStopping`.
+  fn parent_gone(&self) -> bool {
+    self
+      .context
+      .inner()
+      .shutdown_initiated
+      .load(std::sync::atomic::Ordering::Acquire)
+      || self.socket_logic.mailbox().is_closed()
   }
 }
 
